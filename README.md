@@ -1,0 +1,344 @@
+# CRUD Students & Pets (FastAPI)
+
+Proyecto FastAPI que implementa un **CRUD** para la entidad `Student` y sus `Pet`, con **almacenamiento en memoria** a través de repositorios respaldados por diccionarios. Los datos viven mientras el proceso esté corriendo.
+
+## Tecnologías
+
+- Python 3.13
+- FastAPI + repositorios en memoria
+- HTML + JS + Tailwind CSS (frontend estático)
+
+## Resumen funcional
+
+La API expone operaciones CRUD completas sobre estudiantes y mascotas:
+
+**Estudiantes** — `/api/students`
+
+- **Crear**: `POST /api/students` (opcionalmente con `pets[]` para crear el estudiante y sus mascotas en una sola petición)
+- **Listar**: `GET /api/students`
+- **Buscar por id**: `GET /api/students/:id`
+- **Actualizar**: `PATCH /api/students/:id`
+- **Eliminar**: `DELETE /api/students/:id` (elimina también sus mascotas)
+
+**Mascotas** — `/api/students/:studentId/pets`
+
+- **Listar**: `GET /api/students/:studentId/pets`
+- **Crear**: `POST /api/students/:studentId/pets`
+- **Actualizar**: `PATCH /api/students/:studentId/pets/:petId`
+- **Eliminar**: `DELETE /api/students/:studentId/pets/:petId`
+
+**Autenticación** — `/api/auth`
+
+- **Registro**: `POST /api/auth/register`
+- **Inicio de sesión**: `POST /api/auth/login`
+- **Cierre de sesión**: `POST /api/auth/logout`
+- **Sesión actual**: `GET /api/auth/me`
+- **Solicitar recuperación**: `POST /api/auth/password/forgot`
+- **Restablecer contraseña**: `POST /api/auth/password/reset`
+
+### Recuperación de contraseña
+
+El flujo usa dos endpoints y un enlace con un JWT de vida corta.
+
+**Solicitar el enlace**
+
+```http
+POST /api/auth/password/forgot
+Content-Type: application/json
+
+{ "email": "ana@example.com" }
+```
+
+Si el correo existe, la API genera un JWT con `sub` (id del usuario), `jti` (identificador único), `purpose: "password_reset"` y `exp` de 15 minutos. El `jti` queda pendiente en la tabla `password_reset_tokens` y la respuesta incluye el enlace:
+
+```json
+{
+	"code": 200,
+	"success": true,
+	"message": "Operación exitosa",
+	"timestamp": "2026-11-17T16:00:00.000Z",
+	"data": {
+		"reset_link": "http://localhost:3000/reset-password.html?token=..."
+	}
+}
+```
+
+Si el correo no existe, la respuesta mantiene el mismo formato pero con `reset_link: null` y no se crea ningún token. Al pedir un enlace nuevo se invalida el anterior del mismo usuario.
+
+> En esta demo el correo no se envía: la API devuelve el enlace y la UI lo muestra como un enlace clickeable dentro de un bloque de "correo simulado". En producción el enlace debe enviarse por correo y no incluirse en la respuesta.
+
+**Restablecer la contraseña**
+
+```http
+POST /api/auth/password/reset
+Content-Type: application/json
+
+{
+	"reset_token": "...",
+	"new_password": "nueva-clave-123"
+}
+```
+
+La API valida firma, expiración y `purpose`, busca el `jti` pendiente y comprueba que no esté usado. Luego actualiza la contraseña, marca el token como usado y elimina todas las sesiones del usuario en una sola transacción. Responde `204 No Content`.
+
+Si el token es inválido, expiró o ya fue usado, responde `401` con el mensaje `El enlace de recuperación no es válido o expiró`.
+
+> El `204` es la única respuesta que no usa el envelope JSON, porque no tiene cuerpo. El middleware y el cliente estático lo manejan como caso especial.
+
+### Alta de estudiante con mascotas
+
+`POST /api/students` acepta un arreglo opcional `pets`:
+
+```json
+{
+	"name": "Ana Pérez",
+	"username": "ana_perez",
+	"email": "ana@example.com",
+	"age": 21,
+	"pets": [
+		{ "name": "Firulais", "species": "perro", "age": 3 },
+		{ "name": "Michi", "species": "gato" }
+	]
+}
+```
+
+Si no se envía `pets` (o se envía vacío), el comportamiento es exactamente el mismo de antes.
+
+> **Punto de transacción:** este endpoint realiza varias escrituras (el estudiante y cada mascota). Con un ORM/SQL, todas deben ejecutarse dentro de una transacción: si una mascota falla (por ejemplo, por nombre duplicado), el estudiante y las mascotas anteriores no deben quedar guardados. En esta versión en memoria la implementación es secuencial y **no** hace rollback, a propósito, para que la actividad de ORM/transacciones parta de ese problema.
+
+### Modelo de datos
+
+| Estudiante | Mascota        |
+| ---------- | -------------- |
+| id (UUID)  | id (UUID)      |
+| name       | studentId      |
+| username   | name           |
+| email      | species        |
+| age        | age (opcional) |
+| createdAt  | createdAt      |
+| updatedAt  | updatedAt      |
+
+### Validación y unicidad
+
+La validación se realiza con Pydantic v2:
+
+- `name` (estudiante): texto de 3 a 100 caracteres, sin etiquetas HTML.
+- `username`: texto de 3 a 30 caracteres, solo minúsculas, números y guiones bajos (`^[a-z0-9_]+$`).
+- `email`: dirección de correo electrónico válida.
+- `age` (estudiante): entero entre 18 y 99.
+- `name` / `species` (mascota): texto de 1 a 50 caracteres, sin etiquetas HTML.
+- `age` (mascota): entero entre 0 y 100 (opcional).
+
+Unicidad (rechazado con `409 Conflict`):
+
+- Estudiante: `email` y `username` deben ser únicos.
+- Mascota: `name` debe ser único dentro de un mismo estudiante.
+
+## Estándar de respuesta JSON
+
+Toda respuesta de la API — exitosa o de error — usa el mismo **envelope** `ApiResponse`, definido en [`app/shared/api_response.py`](app/shared/api_response.py). Esto permite que el frontend interprete cualquier respuesta de forma uniforme.
+
+### Envelope común
+
+| Campo       | Tipo                | Descripción                                                               |
+| ----------- | ------------------- | ------------------------------------------------------------------------- |
+| `code`      | `number`            | Código de estado HTTP (coincide con el status de la respuesta).           |
+| `success`   | `boolean`           | `true` si la operación se completó, `false` si hubo error.                |
+| `message`   | `string`            | Resumen legible del resultado (varía según el método HTTP).               |
+| `timestamp` | `string`            | Fecha/hora en ISO 8601 de la respuesta.                                   |
+| `data`      | `object \| null`    | Datos de la operación. Presente en éxito; `null` en errores.              |
+| `error`     | `string` (opcional) | Mensaje de error para errores simples (404, 500).                         |
+| `errors`    | `object` (opcional) | Errores por campo para validación (400) y conflicto (409). Ver más abajo. |
+
+### Respuestas de éxito
+
+Un middleware global ([`api_response.py`](app/shared/api_response.py)) envuelve el retorno de los controladores en `data`:
+
+- **Recurso único** (`GET :id`, `POST`, `PATCH`, `DELETE`): `data` contiene la entidad directamente.
+- **Listado** (`GET` colección): `data` contiene `{ total, items }`.
+
+```json
+{
+  "code": 201,
+  "success": true,
+  "message": "Recurso creado",
+  "timestamp": "2026-09-09T16:49:33.368Z",
+  "data": {
+    "id": "c3600646-abe8-4be3-8096-d6ad629388e2",
+    "name": "Juan Pérez",
+    "username": "juanperez",
+    "email": "juan@example.com",
+    "age": 20,
+    "createdAt": "2026-09-09T16:49:33.000Z",
+    "updatedAt": "2026-09-09T16:49:33.000Z"
+  }
+}
+```
+
+`message` según el método HTTP:
+
+| Método   | `message`             | `code` |
+| -------- | --------------------- | ------ |
+| `GET`    | `Operación exitosa`   | 200    |
+| `POST`   | `Recurso creado`      | 201    |
+| `PATCH`  | `Recurso actualizado` | 200    |
+| `DELETE` | `Recurso eliminado`   | 200    |
+
+### Errores simples (404, 500)
+
+Los errores sin detalle por campo usan el campo `error`:
+
+```json
+{
+  "code": 404,
+  "success": false,
+  "message": "Estudiante no encontrado",
+  "timestamp": "2026-09-09T16:49:53.816Z",
+  "data": null,
+  "error": "Estudiante no encontrado"
+}
+```
+
+### Validación (400) y conflicto (409)
+
+Ambos casos comparten el **mismo esquema** para que el frontend los trate igual: el campo `errors` es un mapa `{ campo: { message } }`, donde la clave es el nombre del campo que falla.
+
+```json
+{
+  "code": 400,
+  "success": false,
+  "message": "Error de validación",
+  "timestamp": "2026-09-09T16:39:30.397Z",
+  "data": null,
+  "errors": {
+    "name": { "message": "El nombre debe tener entre 3 y 100 caracteres" },
+    "email": { "message": "El correo electrónico no es válido" }
+  }
+}
+```
+
+```json
+{
+  "code": 409,
+  "success": false,
+  "message": "Conflicto con datos existentes",
+  "timestamp": "2026-09-09T16:49:45.110Z",
+  "data": null,
+  "errors": {
+    "email": { "message": "El correo electrónico ya está en uso" }
+  }
+}
+```
+
+- `400 Bad Request`: cuando falla la validación. Los DTOs replican las reglas y mensajes de class-validator (NestJS) en español; el handler global ([`exceptions.py`](app/shared/exceptions.py)) convierte los errores al mapa `{ campo: { message } }` (si un campo falla varias reglas, los mensajes se concatenan con `", "`; las propiedades no permitidas devuelven `errors: {}`).
+- `409 Conflict`: cuando se viola una restricción de unicidad. Los servicios lanzan una `HTTPException` con el mismo mapa `errors`, por lo que es indistinguible de una validación a nivel de estructura.
+
+### Interpretación en el frontend
+
+El cliente estático (`public/`) consume este estándar de forma uniforme:
+
+- `public/js/api.js` expone `api()` (hace `fetch` y devuelve `data` en éxito o lanza el envelope en error) y `normalizeErrors()` (convierte `{ campo: { message } }` en `{ campo: message }`).
+- En los formularios, si la respuesta trae `errors`, cada mensaje se muestra bajo su input correspondiente; si trae `error`, se muestra como notificación global (toast).
+
+## Contexto técnico
+
+- **Backend**: FastAPI
+- **Persistencia**: en memoria (repositorios respaldados por diccionarios); los datos se pierden al reiniciar
+- **Validación**: Pydantic v2
+- **Autenticación**: sesiones en PostgreSQL; recuperación de contraseña con JWT firmado (PyJWT)
+- **Frontend**: archivos estáticos en `public/` (Alpine.js + Tailwind CSS + vanilla-sonner, vía CDN)
+- **Gestor de dependencias**: uv
+- **Documentación**: Swagger en `/docs`
+
+La recuperación de contraseña se configura con `PASSWORD_RESET_SECRET` y `PASSWORD_RESET_TTL_MINUTES`. Los valores de desarrollo están en [`.env.example`](.env.example) y el secreto debe cambiarse en producción.
+
+## Ejecución local
+
+1. Instalar dependencias:
+
+    ```bash
+    make install
+    ```
+
+    O directamente con uv:
+
+    ```bash
+    uv sync
+    ```
+
+2. Levantar el servidor en modo desarrollo:
+
+    ```bash
+    make dev
+    ```
+
+    O usando uv:
+
+    ```bash
+    uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 3000
+    ```
+
+La aplicación queda disponible en:
+
+- `http://localhost:3000`
+- `http://localhost:3000/docs`
+
+> Al ser un almacenamiento en memoria, los datos se pierden cada vez que se reinicia el servidor (incluido el reload de desarrollo).
+
+## Pruebas
+
+La suite cubre solo la entidad `Student`, con tests unitarios y E2E.
+
+- **Unitarios**: validación de schemas y lógica de `StudentsService` con repositorios falsos. No requieren PostgreSQL.
+- **E2E**: API completa con `TestClient`, sesión real y PostgreSQL de prueba.
+
+La base de test es independiente de la de desarrollo:
+
+- Servicio `db-test` definido en `docker-compose.test.yml`.
+- Puerto `5433`.
+- Base `icinf1108_test`.
+- Datos en `tmpfs`, por lo que se pierden al bajar el contenedor.
+- El esquema se crea con las migraciones de Alembic.
+- Las tablas se truncan antes de cada test.
+
+Comandos:
+
+```bash
+make test-unit           # unitarios, sin base de datos
+make test-e2e            # levanta db-test y ejecuta los E2E
+make test                # suite completa
+make test-down           # baja db-test y elimina sus datos
+```
+
+También se puede ejecutar directamente:
+
+```bash
+uv run pytest -m unit
+uv run pytest -m e2e
+uv run pytest
+```
+
+Si necesitas apuntar a otra base, define `TEST_DATABASE_URL`. El nombre de la base debe terminar en `_test` para evitar truncar una base de desarrollo por error.
+
+### Cómo leer los tests
+
+- Cada función de test tiene un docstring que explica qué verifica y qué espera.
+- Los casos parametrizados usan `ids` legibles, por ejemplo `vacio`, `corto` o `html`.
+- `tests/conftest.py` documenta las fixtures de base de datos, `TestClient` y sesión autenticada.
+- `tests/students/conftest.py` documenta los repositorios falsos y los datos reutilizables.
+- Los tests unitarios no tocan PostgreSQL. Los E2E usan la base de test y una sesión real.
+
+Para ejecutar un test puntual:
+
+```bash
+uv run pytest tests/students/unit/test_service.py::test_create_without_pets -v
+```
+
+## Comandos útiles
+
+- `make install` — sincroniza dependencias con uv
+- `make dev` — arranca uvicorn en modo reload
+- `make lint` — ejecuta Ruff (con autocorrección)
+- `make format` — formatea el código con Ruff
+- `make format-check` — verifica el formato
+- `make clean` — elimina `.venv`, cachés y artefactos
